@@ -2,6 +2,8 @@
 
 import argparse
 import contextlib
+import gzip
+import json
 import multiprocessing
 import logging
 import os
@@ -38,6 +40,12 @@ class Handler(SimpleHTTPRequestHandler):
     def _split_request(self):
         parts = urlsplit(self.path)
         return parts.path, parse_qs(parts.query)
+
+    def _read_body(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        if self.headers.get('Content-Encoding') == 'gzip':
+            body = gzip.decompress(body)
+        return body
 
     def _serve_simple(self, uri):
         with open(uri, 'rb') as source:
@@ -129,6 +137,16 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(user_agent.encode())
+        elif request_path == '/gzip_response':
+            accept_encoding = self.headers.get('Accept-Encoding', '')
+            body = json.dumps({"accept_encoding": accept_encoding}).encode()
+            self.send_response(200)
+            if 'gzip' in accept_encoding:
+                body = gzip.compress(body)
+                self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Content-Length', len(body))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             if self.server.fail_injector is not None and self.server.fail_injector.fail(self):
                 return
@@ -158,9 +176,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         elif request_path == "/director/manifest":
-            content_length = int(self.headers['Content-Length'])  # <--- Gets the size of data
-            post_data = self.rfile.read(content_length)  # <--- Gets the data itself
-            print(post_data)  # <-- Print post data
+            post_data = self._read_body()
+            print(post_data)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"{}")
@@ -173,12 +190,17 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(b"{\"access_token\": \"token\"}")
             else:
                 self.wfile.write(b'')
+        elif request_path == '/reject_gzip' and self.headers.get('Content-Encoding') == 'gzip':
+            self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            self.send_response(415)
+            self.end_headers()
         else:
             # for httpclient_test
             self.send_response(200)
             self.end_headers()
-            length = int(self.headers.get('content-length'))
-            result = b'{"data": %b, "path": "%b"}'%(self.rfile.read(length), bytes(self.path, "utf8"))
+            encoding = self.headers.get('Content-Encoding', '')
+            result = b'{"data": %b, "path": "%b", "encoding": "%b"}' % (
+                self._read_body(), bytes(self.path, "utf8"), bytes(encoding, "utf8"))
             self.wfile.write(result)
 
     def do_PUT(self):

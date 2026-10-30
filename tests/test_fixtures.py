@@ -1,5 +1,6 @@
 import subprocess
 import logging
+import gzip
 import json
 import tempfile
 import threading
@@ -537,6 +538,8 @@ class DirectorRepo(UptaneRepo):
             try:
                 data_size = int(self.headers['Content-Length'])
                 data_string = self.rfile.read(data_size)
+                if self.headers.get('Content-Encoding') == 'gzip':
+                    data_string = gzip.decompress(data_string)
                 json_data = json.loads(data_string)
             except Exception as exc:
                 logger.error(exc)

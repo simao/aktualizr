@@ -99,6 +99,8 @@ TEST(HttpClient, Post) {
   Json::Value response = http.post(server + path, data).getJson();
   EXPECT_EQ(response["path"].asString(), path);
   EXPECT_EQ(response["data"]["key"].asString(), "val");
+  // Too small for gzip to pay off, so it goes out uncompressed.
+  EXPECT_EQ(response["encoding"].asString(), "");
 }
 
 // NOLINTNEXTLINE(*non-const*)
@@ -112,6 +114,74 @@ TEST(HttpClient, Put) {
 
   EXPECT_EQ(json["path"].asString(), path);
   EXPECT_EQ(json["data"]["key"].asString(), "val");
+}
+
+static Json::Value compressibleBody() {
+  Json::Value data;
+  data["key"] = std::string(4096, 'x');
+  return data;
+}
+
+/* Request bodies that shrink under gzip are sent with Content-Encoding: gzip. */
+// NOLINTNEXTLINE(*non-const*)
+TEST(HttpClient, PostPutGzip) {
+  HttpClient http;
+  const Json::Value data = compressibleBody();
+
+  Json::Value response = http.post(server + "/path", data).getJson();
+  EXPECT_EQ(response["encoding"].asString(), "gzip");
+  EXPECT_EQ(response["data"], data);
+
+  response = http.put(server + "/path", data).getJson();
+  EXPECT_EQ(response["encoding"].asString(), "gzip");
+  EXPECT_EQ(response["data"], data);
+}
+
+/* A 415 to a gzipped body triggers an uncompressed resend, and the client
+ * stops compressing from then on. */
+// NOLINTNEXTLINE(*non-const*)
+TEST(HttpClient, PostGzipFallbackOn415) {
+  HttpClient http;
+  const Json::Value data = compressibleBody();
+
+  HttpResponse resp = http.post(server + "/reject_gzip", data);
+  ASSERT_EQ(resp.http_status_code, 200);
+  Json::Value response = resp.getJson();
+  EXPECT_EQ(response["encoding"].asString(), "");
+  EXPECT_EQ(response["data"], data);
+
+  response = http.post(server + "/path", data).getJson();
+  EXPECT_EQ(response["encoding"].asString(), "");
+  EXPECT_EQ(response["data"], data);
+
+  // Copies keep the fallback, fresh clients do not.
+  HttpClient http_copy(http);
+  EXPECT_EQ(http_copy.post(server + "/path", data).getJson()["encoding"].asString(), "");
+  HttpClient http_fresh;
+  EXPECT_EQ(http_fresh.post(server + "/path", data).getJson()["encoding"].asString(), "gzip");
+}
+
+/* Responses may be gzip-encoded; curl decodes them transparently. */
+// NOLINTNEXTLINE(*non-const*)
+TEST(HttpClient, GetAcceptsGzip) {
+  HttpClient http;
+  HttpResponse resp = http.get(server + "/gzip_response", HttpInterface::kNoLimit, nullptr);
+  ASSERT_TRUE(resp.isOk());
+  EXPECT_NE(resp.getJson()["accept_encoding"].asString().find("gzip"), std::string::npos);
+}
+
+/* Downloads must stay byte-exact, so they don't ask for an encoding. */
+// NOLINTNEXTLINE(*non-const*)
+TEST(HttpClient, DownloadNoAcceptEncoding) {
+  HttpClient http;
+  std::string body;
+  auto write_cb = [](char* ptr, size_t size, size_t nmemb, void* userp) -> size_t {
+    static_cast<std::string*>(userp)->append(ptr, size * nmemb);
+    return size * nmemb;
+  };
+  HttpResponse resp = http.download(server + "/gzip_response", write_cb, nullptr, &body, 0);
+  ASSERT_TRUE(resp.isOk());
+  EXPECT_EQ(Utils::parseJSON(body)["accept_encoding"].asString(), "");
 }
 
 // NOLINTNEXTLINE(*non-const*)

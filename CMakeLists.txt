@@ -86,6 +86,7 @@ find_package(CURL REQUIRED)
 find_package(OpenSSL 1.0.2 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(LibArchive REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(sodium REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(Git)
@@ -343,6 +344,7 @@ include_directories(SYSTEM ${SQLITE3_INCLUDE_DIRS})
 include_directories(SYSTEM ${LIBP11_INCLUDE_DIR})
 include_directories(SYSTEM ${sodium_INCLUDE_DIR})
 include_directories(SYSTEM ${OPENSSL_INCLUDE_DIR})
+include_directories(SYSTEM ${ZLIB_INCLUDE_DIRS})
 include_directories(SYSTEM ${CURL_INCLUDE_DIR})
 include_directories(SYSTEM ${LibArchive_INCLUDE_DIR})
 
@@ -387,6 +389,7 @@ set (AKTUALIZR_EXTERNAL_LIBS
     ${LIBOSTREE_LIBRARIES}
     ${SQLITE3_LIBRARIES}
     ${LibArchive_LIBRARIES}
+    ${ZLIB_LIBRARIES}
     ${LIBP11_LIBRARIES}
     ${GLIB2_LIBRARIES}
     ${SYSTEMD_LIBRARIES})

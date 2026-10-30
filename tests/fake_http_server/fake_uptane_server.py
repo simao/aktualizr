@@ -2,6 +2,7 @@
 
 import sys
 import socket
+import gzip
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -29,7 +30,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get('content-length'))
-        data = json.loads(self.rfile.read(length).decode('utf-8'))
+        body = self.rfile.read(length)
+        if self.headers.get('Content-Encoding') == 'gzip':
+            body = gzip.decompress(body)
+        data = json.loads(body.decode('utf-8'))
         if self.path == "/devices":
             return self.do_devicesRegister(data)
         elif self.path == "/director/ecus":

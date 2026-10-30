@@ -5,6 +5,7 @@ import os
 import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import ssl
+import gzip
 import json
 
 top_path = sys.argv[2]
@@ -36,7 +37,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get('content-length'))
-        data = json.loads(self.rfile.read(length).decode('utf-8'))
+        body = self.rfile.read(length)
+        if self.headers.get('Content-Encoding') == 'gzip':
+            body = gzip.decompress(body)
+        data = json.loads(body.decode('utf-8'))
         if self.path == "/director/ecus":
             return self.do_ecuRegister(data)
         elif self.path.startswith("/director/manifest"):

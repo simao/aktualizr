@@ -1,6 +1,7 @@
 #ifndef HTTPCLIENT_H_
 #define HTTPCLIENT_H_
 
+#include <atomic>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -126,6 +127,17 @@ class HttpClient : public HttpInterface {
    */
   CurlHandle dupCurl();
 
+  /**
+   * Send a request body with POST or PUT. The body is gzip-compressed (with
+   * Content-Encoding: gzip) when that makes it smaller. If the server answers
+   * 415 Unsupported Media Type, the request is resent uncompressed and
+   * compression is disabled for the lifetime of this client.
+   */
+  HttpResponse sendBody(const std::string &url, const char *method, const std::string &content_type,
+                        const std::string &data, int64_t size_limit);
+  HttpResponse sendBodyOnce(const std::string &url, const char *method, const std::string &content_type,
+                            const std::string &body, bool gzipped, int64_t size_limit);
+
   mutable std::mutex curl_mutex_;
   static const CurlGlobalInitWrapper manageCurlGlobalInit_;
   CurlHandle template_handle_;
@@ -147,5 +159,6 @@ class HttpClient : public HttpInterface {
   }
   bool pkcs11_key{false};
   bool pkcs11_cert{false};
+  std::atomic<bool> compress_requests_{true};
 };
 #endif

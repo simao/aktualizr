@@ -19,6 +19,7 @@ target_link_libraries(aktualizr-cert-provider
     ${LibArchive_LIBRARIES}
     ${LIBP11_LIBRARIES}
     ${CURL_LIBRARIES}
+    ${ZLIB_LIBRARIES}
     ${OPENSSL_LIBRARIES}
     ${sodium_LIBRARY_RELEASE}
     )

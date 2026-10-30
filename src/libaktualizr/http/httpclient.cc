@@ -1,8 +1,13 @@
 #include "httpclient.h"
 
 #include <cassert>
+#include <climits>
+#include <cstring>
 #include <sstream>
 #include <utility>
+
+#define ZLIB_CONST
+#include <zlib.h>
 
 #include "logging/logging.h"
 #include "utilities/utils.h"
@@ -60,6 +65,33 @@ static int ProgressHandler(void* clientp, curl_off_t dltotal, curl_off_t dlnow, 
   return 0;
 }
 
+/**
+ * Gzip-compress data into out in a single pass. Returns false if zlib fails.
+ */
+static bool gzipCompress(const std::string& data, std::string& out) {
+  if (data.size() > UINT_MAX) {
+    return false;
+  }
+  z_stream zs{};
+  // windowBits 15 + 16 selects the gzip wrapper instead of the raw zlib one.
+  if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+    return false;
+  }
+  out.resize(deflateBound(&zs, static_cast<uLong>(data.size())));
+  zs.next_in = reinterpret_cast<const Bytef*>(data.data());
+  zs.avail_in = static_cast<uInt>(data.size());
+  zs.next_out = reinterpret_cast<Bytef*>(&out[0]);
+  zs.avail_out = static_cast<uInt>(out.size());
+  // The output buffer is deflateBound() sized, so a single Z_FINISH completes.
+  const int ret = deflate(&zs, Z_FINISH);
+  deflateEnd(&zs);
+  if (ret != Z_STREAM_END) {
+    return false;
+  }
+  out.resize(zs.total_out);
+  return true;
+}
+
 HttpClient::HttpClient(const std::vector<std::string>* extra_headers) : template_handle_{curl_easy_init(), nullptr} {
   if (template_handle_.get() == nullptr) {
     throw std::runtime_error("Could not initialize curl");
@@ -80,6 +112,10 @@ HttpClient::HttpClient(const std::vector<std::string>* extra_headers) : template
 
   template_handle_.setopt(CURLOPT_VERBOSE, get_curlopt_verbose());
 
+  // Advertise every encoding this libcurl supports; responses are decoded
+  // transparently before they reach writeString.
+  template_handle_.setopt(CURLOPT_ACCEPT_ENCODING, "");
+
   template_handle_.appendHeader("Accept: */*");
 
   if (extra_headers != nullptr) {
@@ -92,6 +128,8 @@ HttpClient::HttpClient(const std::vector<std::string>* extra_headers) : template
 
 HttpClient::HttpClient(const std::string& socket) : HttpClient() {
   template_handle_.setopt(CURLOPT_UNIX_SOCKET_PATH, socket.c_str());
+  // Local daemon APIs are not expected to accept compressed request bodies.
+  compress_requests_ = false;
 }
 
 HttpClient::HttpClient(const HttpClient& curl_in)
@@ -99,7 +137,8 @@ HttpClient::HttpClient(const HttpClient& curl_in)
       template_handle_(curl_easy_duphandle(curl_in.template_handle_.get()),
                        curl_slist_dup(curl_in.template_handle_.headers())),
       pkcs11_key(curl_in.pkcs11_key),
-      pkcs11_cert(curl_in.pkcs11_key) {}
+      pkcs11_cert(curl_in.pkcs11_key),
+      compress_requests_(curl_in.compress_requests_.load()) {}
 
 const CurlGlobalInitWrapper HttpClient::manageCurlGlobalInit_{};
 
@@ -218,13 +257,44 @@ std::string HttpClient::getEffectiveUrl(const std::string& url) {
   return (effective_url != nullptr) ? effective_url : "";
 }
 
-HttpResponse HttpClient::post(const std::string& url, const std::string& content_type, const std::string& data) {
+HttpResponse HttpClient::sendBody(const std::string& url, const char* method, const std::string& content_type,
+                                  const std::string& data, int64_t size_limit) {
+  std::string gzipped;
+  if (compress_requests_ && gzipCompress(data, gzipped) && gzipped.size() < data.size()) {
+    HttpResponse response = sendBodyOnce(url, method, content_type, gzipped, true, size_limit);
+    if (response.http_status_code != 415) {
+      return response;
+    }
+    LOG_WARNING << "Server rejected gzip-encoded request body (http code 415) for " << url
+                << "; resending and sending all further requests uncompressed";
+    compress_requests_ = false;
+  }
+  return sendBodyOnce(url, method, content_type, data, false, size_limit);
+}
+
+HttpResponse HttpClient::sendBodyOnce(const std::string& url, const char* method, const std::string& content_type,
+                                      const std::string& body, bool gzipped, int64_t size_limit) {
   auto guard = dupCurl();
   guard.appendHeader("Content-Type: " + content_type);
+  if (gzipped) {
+    guard.appendHeader("Content-Encoding: gzip");
+  }
+  // appendHeader may update the list head; keep CURLOPT_HTTPHEADER in sync.
+  guard.setopt(CURLOPT_HTTPHEADER, guard.headers());
   guard.setopt(CURLOPT_URL, url.c_str());
-  guard.setopt(CURLOPT_POST, 1);
-  guard.setopt(CURLOPT_POSTFIELDS, data.c_str());
-  return perform(guard.get(), RETRY_TIMES, HttpInterface::kPostRespLimit);
+  // Pass the size explicitly: a gzipped body contains NUL bytes.
+  guard.setopt(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+  guard.setopt(CURLOPT_POSTFIELDS, body.data());
+  if (strcmp(method, "POST") == 0) {
+    guard.setopt(CURLOPT_POST, 1);
+  } else {
+    guard.setopt(CURLOPT_CUSTOMREQUEST, method);
+  }
+  return perform(guard.get(), RETRY_TIMES, size_limit);
+}
+
+HttpResponse HttpClient::post(const std::string& url, const std::string& content_type, const std::string& data) {
+  return sendBody(url, "POST", content_type, data, HttpInterface::kPostRespLimit);
 }
 
 HttpResponse HttpClient::post(const std::string& url, const Json::Value& data) {
@@ -234,12 +304,7 @@ HttpResponse HttpClient::post(const std::string& url, const Json::Value& data) {
 }
 
 HttpResponse HttpClient::put(const std::string& url, const std::string& content_type, const std::string& data) {
-  auto guard = dupCurl();
-  guard.appendHeader("Content-Type: " + content_type);
-  guard.setopt(CURLOPT_URL, url.c_str());
-  guard.setopt(CURLOPT_POSTFIELDS, data.c_str());
-  guard.setopt(CURLOPT_CUSTOMREQUEST, "PUT");
-  return perform(guard.get(), RETRY_TIMES, HttpInterface::kPutRespLimit);
+  return sendBody(url, "PUT", content_type, data, HttpInterface::kPutRespLimit);
 }
 
 HttpResponse HttpClient::put(const std::string& url, const Json::Value& data) {
@@ -298,6 +363,9 @@ std::future<HttpResponse> HttpClient::downloadAsync(const std::string& url, curl
   }
   curl_download.setopt(CURLOPT_TIMEOUT, 0);
   curl_download.setopt(CURLOPT_RESUME_FROM_LARGE, from);
+  // Downloads must be byte-exact: target hashes and resume offsets refer to
+  // the stored file, which a Content-Encoding would make curl alter.
+  curl_download.setopt(CURLOPT_ACCEPT_ENCODING, static_cast<const char*>(nullptr));
 
   std::promise<HttpResponse> resp_promise;
   auto resp_future = resp_promise.get_future();
