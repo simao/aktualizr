@@ -170,18 +170,80 @@ TEST(HttpClient, GetAcceptsGzip) {
   EXPECT_NE(resp.getJson()["accept_encoding"].asString().find("gzip"), std::string::npos);
 }
 
+static size_t appendToString(char* ptr, size_t size, size_t nmemb, void* userp) {
+  static_cast<std::string*>(userp)->append(ptr, size * nmemb);
+  return size * nmemb;
+}
+
 /* Downloads must stay byte-exact, so they don't ask for an encoding. */
 // NOLINTNEXTLINE(*non-const*)
 TEST(HttpClient, DownloadNoAcceptEncoding) {
   HttpClient http;
   std::string body;
-  auto write_cb = [](char* ptr, size_t size, size_t nmemb, void* userp) -> size_t {
-    static_cast<std::string*>(userp)->append(ptr, size * nmemb);
-    return size * nmemb;
-  };
-  HttpResponse resp = http.download(server + "/gzip_response", write_cb, nullptr, &body, 0);
+  HttpResponse resp = http.download(server + "/gzip_response", appendToString, nullptr, &body, 0);
   ASSERT_TRUE(resp.isOk());
   EXPECT_EQ(Utils::parseJSON(body)["accept_encoding"].asString(), "");
+}
+
+/* An in-flight download keeps the shared curl state alive after its client
+ * has been destroyed. */
+// NOLINTNEXTLINE(*non-const*)
+TEST(HttpClient, DownloadOutlivesClient) {
+  const std::string url = server + "/slow_file";
+  std::string body;
+  std::future<HttpResponse> resp;
+  {
+    HttpClient http;
+    resp = http.downloadAsync(url, appendToString, nullptr, &body, 0);
+  }
+  EXPECT_TRUE(resp.get().isOk());
+  EXPECT_EQ(body, std::string(20, 'a'));
+}
+
+static std::string tlsHandshakeKind(const HttpResponse& resp) {
+  // openssl s_server -www reports each connection as "New, <protocol>, ..."
+  // or "Reused, <protocol>, ...".
+  if (resp.body.find("\nReused, ") != std::string::npos) {
+    return "Reused";
+  }
+  if (resp.body.find("\nNew, ") != std::string::npos) {
+    return "New";
+  }
+  return "unknown: " + resp.body;
+}
+
+/* Every request opens a new connection, but it resumes the TLS session of an
+ * earlier one instead of repeating the full handshake. Copies of a client
+ * share its sessions. */
+// NOLINTNEXTLINE(*non-const*)
+TEST(HttpClient, TlsSessionResumption) {
+  const std::string port = TestUtils::getFreePort();
+  boost::process::child tls_server(boost::process::search_path("openssl"), "s_server", "-accept", port, "-www", "-cert",
+                                   "tests/fake_http_server/server.crt", "-key", "tests/fake_http_server/server.key",
+                                   boost::process::std_out > boost::process::null);
+  const std::string url = "https://localhost:" + port + "/";
+  const std::string cert = Utils::readFile("tests/fake_http_server/server.crt");
+  const std::string key = Utils::readFile("tests/fake_http_server/server.key");
+
+  // Wait for the server with a separate client, so the client under test
+  // starts with an empty session cache.
+  {
+    HttpClient probe;
+    probe.setCerts(cert, CryptoSource::kFile, cert, CryptoSource::kFile, key, CryptoSource::kFile);
+    for (int i = 0; i < 50 && !probe.get(url, HttpInterface::kNoLimit, nullptr).isOk(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
+  HttpClient http;
+  http.setCerts(cert, CryptoSource::kFile, cert, CryptoSource::kFile, key, CryptoSource::kFile);
+  EXPECT_EQ(tlsHandshakeKind(http.get(url, HttpInterface::kNoLimit, nullptr)), "New");
+  EXPECT_EQ(tlsHandshakeKind(http.get(url, HttpInterface::kNoLimit, nullptr)), "Reused");
+
+  HttpClient http_copy(http);
+  EXPECT_EQ(tlsHandshakeKind(http_copy.get(url, HttpInterface::kNoLimit, nullptr)), "Reused");
+
+  tls_server.terminate();
 }
 
 // NOLINTNEXTLINE(*non-const*)

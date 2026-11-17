@@ -1,6 +1,7 @@
 #ifndef HTTPCLIENT_H_
 #define HTTPCLIENT_H_
 
+#include <array>
 #include <atomic>
 #include <future>
 #include <memory>
@@ -74,20 +75,52 @@ class HttpClient : public HttpInterface {
   void timeout(int64_t ms);
 
   /**
+   * RAII wrapper around a CURLSH* that shares the TLS session and DNS caches
+   * between the easy handles of one HttpClient, so that new connections can
+   * resume a TLS session instead of repeating the full handshake. Requests
+   * run on several threads, so access is serialised with one mutex per
+   * shared data type through curl's lock callbacks.
+   */
+  class CurlShare {
+   public:
+    CurlShare();
+    ~CurlShare() { curl_share_cleanup(share_); }
+    CurlShare(const CurlShare &) = delete;
+    CurlShare(CurlShare &&) = delete;
+    CurlShare &operator=(const CurlShare &) = delete;
+    CurlShare &operator=(CurlShare &&) = delete;
+
+    CURLSH *get() const { return share_; }
+
+   private:
+    static void lock(CURL *handle, curl_lock_data data, curl_lock_access access, void *userptr);
+    static void unlock(CURL *handle, curl_lock_data data, void *userptr);
+    // curl only passes curl_lock_data values, all below CURL_LOCK_DATA_LAST.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
+    std::mutex &mutexFor(curl_lock_data data) { return mutexes_[data]; }
+
+    CURLSH *share_;
+    std::array<std::mutex, CURL_LOCK_DATA_LAST> mutexes_;
+  };
+
+  /**
    * RAII wrapper around a CURL* handle and its owned header list.
    * Movable, non-copyable. The destructor calls curl_easy_cleanup and
-   * curl_slist_free_all on the owned resources (if non-null).
+   * curl_slist_free_all on the owned resources (if non-null). A handle
+   * attached to a CurlShare keeps it alive until after curl_easy_cleanup.
    */
   class CurlHandle {
    public:
     CurlHandle() = default;
-    CurlHandle(CURL *curl, curl_slist *headers) : curl_(curl), headers_(headers) {}
+    CurlHandle(CURL *curl, curl_slist *headers, std::shared_ptr<CurlShare> share = nullptr)
+        : curl_(curl), headers_(headers), share_(std::move(share)) {}
     ~CurlHandle() {
       curl_slist_free_all(headers_);
       curl_easy_cleanup(curl_);
     }
 
-    CurlHandle(CurlHandle &&other) noexcept : curl_(other.curl_), headers_(other.headers_) {
+    CurlHandle(CurlHandle &&other) noexcept
+        : curl_(other.curl_), headers_(other.headers_), share_(std::move(other.share_)) {
       other.curl_ = nullptr;
       other.headers_ = nullptr;
     }
@@ -97,6 +130,7 @@ class HttpClient : public HttpInterface {
         curl_easy_cleanup(curl_);
         curl_ = other.curl_;
         headers_ = other.headers_;
+        share_ = std::move(other.share_);
         other.curl_ = nullptr;
         other.headers_ = nullptr;
       }
@@ -118,12 +152,13 @@ class HttpClient : public HttpInterface {
    private:
     CURL *curl_{nullptr};
     curl_slist *headers_{nullptr};
+    std::shared_ptr<CurlShare> share_;
   };
 
   /**
    * Duplicate the template curl handle and headers under the mutex.
-   * Sets CURLOPT_HTTPHEADER, CURLOPT_SSLCERTTYPE (if pkcs11), and
-   * the speed-limit options on the new handle.
+   * Sets CURLOPT_HTTPHEADER, CURLOPT_SSLCERTTYPE (if pkcs11), the
+   * speed-limit options and CURLOPT_SHARE on the new handle.
    */
   CurlHandle dupCurl();
 
@@ -140,6 +175,7 @@ class HttpClient : public HttpInterface {
 
   mutable std::mutex curl_mutex_;
   static const CurlGlobalInitWrapper manageCurlGlobalInit_;
+  std::shared_ptr<CurlShare> share_;
   CurlHandle template_handle_;
   HttpResponse perform(CURL *curl_handler, int retry_times, int64_t size_limit);
   static curl_slist *curl_slist_dup(curl_slist *sl);

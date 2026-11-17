@@ -92,7 +92,33 @@ static bool gzipCompress(const std::string& data, std::string& out) {
   return true;
 }
 
-HttpClient::HttpClient(const std::vector<std::string>* extra_headers) : template_handle_{curl_easy_init(), nullptr} {
+HttpClient::CurlShare::CurlShare() : share_(curl_share_init()) {
+  if (share_ == nullptr) {
+    throw std::runtime_error("Could not initialize curl share");
+  }
+  if (curl_share_setopt(share_, CURLSHOPT_LOCKFUNC, lock) != CURLSHE_OK ||
+      curl_share_setopt(share_, CURLSHOPT_UNLOCKFUNC, unlock) != CURLSHE_OK ||
+      curl_share_setopt(share_, CURLSHOPT_USERDATA, this) != CURLSHE_OK ||
+      curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION) != CURLSHE_OK ||
+      curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS) != CURLSHE_OK) {
+    curl_share_cleanup(share_);
+    throw std::runtime_error("Could not configure curl share");
+  }
+}
+
+void HttpClient::CurlShare::lock(CURL* handle, curl_lock_data data, curl_lock_access access, void* userptr) {
+  (void)handle;
+  (void)access;
+  static_cast<CurlShare*>(userptr)->mutexFor(data).lock();
+}
+
+void HttpClient::CurlShare::unlock(CURL* handle, curl_lock_data data, void* userptr) {
+  (void)handle;
+  static_cast<CurlShare*>(userptr)->mutexFor(data).unlock();
+}
+
+HttpClient::HttpClient(const std::vector<std::string>* extra_headers)
+    : share_(std::make_shared<CurlShare>()), template_handle_{curl_easy_init(), nullptr} {
   if (template_handle_.get() == nullptr) {
     throw std::runtime_error("Could not initialize curl");
   }
@@ -134,6 +160,7 @@ HttpClient::HttpClient(const std::string& socket) : HttpClient() {
 
 HttpClient::HttpClient(const HttpClient& curl_in)
     : HttpInterface(curl_in),
+      share_(curl_in.share_),
       template_handle_(curl_easy_duphandle(curl_in.template_handle_.get()),
                        curl_slist_dup(curl_in.template_handle_.headers())),
       pkcs11_key(curl_in.pkcs11_key),
@@ -145,8 +172,9 @@ const CurlGlobalInitWrapper HttpClient::manageCurlGlobalInit_{};
 HttpClient::CurlHandle HttpClient::dupCurl() {
   std::lock_guard<std::mutex> lock(curl_mutex_);
   CurlHandle res(Utils::curlDupHandleWrapper(template_handle_.get(), pkcs11_key),
-                 curl_slist_dup(template_handle_.headers()));
+                 curl_slist_dup(template_handle_.headers()), share_);
   res.setopt(CURLOPT_HTTPHEADER, res.headers());
+  res.setopt(CURLOPT_SHARE, share_->get());
   if (pkcs11_cert) {
     res.setopt(CURLOPT_SSLCERTTYPE, "ENG");
   }
@@ -290,6 +318,7 @@ HttpResponse HttpClient::sendBodyOnce(const std::string& url, const char* method
   } else {
     guard.setopt(CURLOPT_CUSTOMREQUEST, method);
   }
+  LOG_DEBUG << method << " " << url;
   return perform(guard.get(), RETRY_TIMES, size_limit);
 }
 
